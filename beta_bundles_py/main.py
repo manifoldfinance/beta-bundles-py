@@ -30,12 +30,8 @@ def load_env_vars():
         "BETA_BUNDLE_RPC",
         "AUCTIONEER",
         "BIDDER",
-        "TX_ARGS",
-        "TX_SIG",
         "CHAIN_ID",
         "CALLER",
-        "TX_TO",
-        "TX_VALUE",
         "PRIVATE_KEY",
         "WEI_PER_GAS",
     ]
@@ -77,7 +73,9 @@ sig_auction_opened = w3.keccak(text="AuctionOpened(uint256,uint120)").hex()
 sig_auction_paid = w3.keccak(text="AuctionPaidOut(uint256)").hex()
 sig_auction_refunded = w3.keccak(text="AuctionRefund(uint256)").hex()
 
-tx_global = None
+txs_global = []
+with open('bundle.json', 'r') as f:
+    bundle = json.load(f)
 
 
 def submit_bundle(slot: int, txs: list):
@@ -101,38 +99,55 @@ def submit_bundle(slot: int, txs: list):
         return None
 
 
-def build_transaction(slot):
+def build_bundle(slot):
     """Build and sign a transaction."""
-    global tx_global
+    global txs_global
+    caller_nonce = 0
     try:
-        args = json.loads(env_vars["TX_ARGS"])
-        sig = env_vars["TX_SIG"]
-        arg_types = sig[sig.find("(") + 1 : sig.find(")")].split(",")
-        data = w3.keccak(text=sig)[:4] + encode(arg_types, args)
+        for tx in bundle:
+            data = b''
+            if isinstance(tx, str):
+                # tx is already in raw signed format
+                txs_global.append(tx)
+                continue
+            if "sig" in tx:
+                # encode calldata
+                args = tx["args"]
+                sig = tx["sig"]
+                arg_types = sig[sig.find("(") + 1 : sig.find(")")].split(",")
+                data = w3.keccak(text=sig)[:4] + encode(arg_types, args)
+            else:
+                # data must be present
+                data = tx["data"]
 
-        block = w3_l1.eth.get_block("latest")
-        base_fee = block.baseFeePerGas * 2
+            block = w3_l1.eth.get_block("latest")
+            base_fee = block.baseFeePerGas * 2
+            
+            if caller_nonce == 0:
+                caller_nonce = w3_l1.eth.get_transaction_count(env_vars["CALLER"])
+            else:
+                caller_nonce = caller_nonce + 1
+                
+            transaction = {
+                "chainId": int(env_vars["CHAIN_ID"]),
+                "from": env_vars["CALLER"],
+                "to": tx["to"],
+                "value": int(tx["value"]),
+                "nonce": caller_nonce,
+                "maxPriorityFeePerGas": 0,
+                "data": data,
+                "gas": 1000000,
+                "maxFeePerGas": base_fee,
+            }
 
-        transaction = {
-            "chainId": int(env_vars["CHAIN_ID"]),
-            "from": env_vars["CALLER"],
-            "to": env_vars["TX_TO"],
-            "value": int(env_vars["TX_VALUE"]),
-            "nonce": w3_l1.eth.get_transaction_count(env_vars["CALLER"]),
-            "maxPriorityFeePerGas": 0,
-            "data": data,
-            "gas": 1000000,
-            "maxFeePerGas": base_fee,
-        }
+            transaction["gas"] = w3_l1.eth.estimate_gas(transaction)
+            signed = w3_l1.eth.account.sign_transaction(
+                transaction, env_vars["PRIVATE_KEY"]
+            )
+            txs_global.append(signed.rawTransaction.hex())
 
-        transaction["gas"] = w3_l1.eth.estimate_gas(transaction)
-        signed = w3_l1.eth.account.sign_transaction(
-            transaction, env_vars["PRIVATE_KEY"]
-        )
-        tx_global = signed.rawTransaction.hex()
-
-        logger.debug(f"Signed transaction: {tx_global}")
-        hash = submit_bundle(slot, [tx_global])
+        logger.debug(f"Signed transactions: {txs_global}")
+        hash = submit_bundle(slot, txs_global)
 
         wei_per_gas = int(env_vars["WEI_PER_GAS"])
         tx = bidder.functions.openBid(
@@ -150,26 +165,26 @@ def build_transaction(slot):
         tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
         w3.eth.wait_for_transaction_receipt(tx_hash)
     except Exception as e:
-        logger.error(f"Failed to build transaction: {e}")
+        logger.error(f"Failed to build bundle: {e}")
 
 
 def handle_event(event):
     """Handle blockchain events."""
-    global tx_global
-    logger.info(event)
+    global txs_global
+    logger.debug(event)
 
     try:
         if event["address"] == env_vars["AUCTIONEER"]:
             topic0 = event["topics"][0].hex()
             if topic0 == sig_auction_opened:
                 slot = int(event["topics"][1].hex(), 16)
-                logger.debug(f"Auction opened at slot {slot}")
+                logger.info(f"Auction opened at slot {slot}")
 
-                if not tx_global:
-                    build_transaction(slot)
+                if len(txs_global) == 0:
+                    build_bundle(slot)
                 else:
-                    submit_bundle(slot, [tx_global])
-                    logger.debug(f"Bundle submitted for slot {slot}")
+                    submit_bundle(slot, txs_global)
+                    logger.info(f"Bundle submitted for slot {slot}")
 
             elif topic0 == sig_auction_closed:
                 slot = int(event["topics"][1].hex(), 16)
